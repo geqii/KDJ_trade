@@ -109,16 +109,19 @@ def run_strategy(df, initial_capital=100000):
                 target_value = current_equity * 0.5
                 shares_to_buy = int(target_value / price)
                 
+                # A-share rule: Buy in lots of 100
+                shares_to_buy = (shares_to_buy // 100) * 100
+                
                 if shares_to_buy > 0:
                     cost = shares_to_buy * price
                     cash -= cost
                     shares += shares_to_buy
                     position_pct = 0.5
                     in_exit_phase = False # Reset exit phase
-                    action = "BUY_BASE"
+                    action = "建仓 (50%)"
                     trades.append({
-                        'Date': date, 'Action': 'BUY_BASE', 'Price': price, 
-                        'Shares': shares_to_buy, 'J': kdj_j, 'Slope': ma20_slope
+                        '日期': date, '操作': '建仓 (50%)', '价格': price, 
+                        '股数': shares_to_buy, 'J值': kdj_j, 'MA20斜率': ma20_slope
                     })
         
         # B. Add Position Condition (Add to 100%)
@@ -126,23 +129,25 @@ def run_strategy(df, initial_capital=100000):
         elif position_pct == 0.5 and not in_exit_phase:
             if kdj_j > 40:
                 # Calculate shares to buy (Remaining capital to reach 100% roughly)
-                # Actually simpler: use remaining cash
                 shares_to_buy = int(cash / price)
+                
+                # A-share rule: Buy in lots of 100
+                shares_to_buy = (shares_to_buy // 100) * 100
                 
                 if shares_to_buy > 0:
                     cost = shares_to_buy * price
                     cash -= cost
                     shares += shares_to_buy
                     position_pct = 1.0
-                    action = "ADD_FULL"
+                    action = "加仓 (100%)"
                     
                     # Initialize Sell State Tracking
                     max_j_since_full = kdj_j # Start recording Max_J
                     has_peaked_40 = True # Confirmed J > 40 (since that triggered this)
                     
                     trades.append({
-                        'Date': date, 'Action': 'ADD_FULL', 'Price': price, 
-                        'Shares': shares_to_buy, 'J': kdj_j, 'Slope': ma20_slope
+                        '日期': date, '操作': '加仓 (100%)', '价格': price, 
+                        '股数': shares_to_buy, 'J值': kdj_j, 'MA20斜率': ma20_slope
                     })
             
             # Note: What if J drops < 0 again while at 0.5? 
@@ -164,16 +169,27 @@ def run_strategy(df, initial_capital=100000):
                 if kdj_j < max_j_since_full * 0.8:
                     # Sell 50% of current holding
                     shares_to_sell = int(shares / 2)
-                    revenue = shares_to_sell * price
-                    cash += revenue
-                    shares -= shares_to_sell
-                    position_pct = 0.5 # Back to 0.5
-                    in_exit_phase = True # Enter exit phase
-                    action = "SELL_HALF"
-                    trades.append({
-                        'Date': date, 'Action': 'SELL_HALF', 'Price': price, 
-                        'Shares': shares_to_sell, 'J': kdj_j, 'Max_J': max_j_since_full
-                    })
+                    
+                    # A-share rule: Sell in lots of 100 is preferred but not strictly required (odd lots allowed in sell)
+                    # But for consistency with strategy "50%", let's try to keep it clean.
+                    # However, strictly speaking, you can sell 1 share in A-share.
+                    # But let's round to nearest 100 for "strategy logic" or just keep integer.
+                    # User asked "A股没有散股，最少一手是100股". Usually means for BUY.
+                    # For SELL, you can sell odd lots. But let's stick to 100 multiples for clean testing if possible,
+                    # or just integer is fine. Let's assume we want to keep holding in 100s.
+                    shares_to_sell = (shares_to_sell // 100) * 100
+                    
+                    if shares_to_sell > 0:
+                        revenue = shares_to_sell * price
+                        cash += revenue
+                        shares -= shares_to_sell
+                        position_pct = 0.5 # Back to 0.5
+                        in_exit_phase = True # Enter exit phase
+                        action = "减仓 (50%)"
+                        trades.append({
+                            '日期': date, '操作': '减仓 (50%)', '价格': price, 
+                            '股数': shares_to_sell, 'J值': kdj_j, 'Max_J': max_j_since_full
+                        })
 
             # 2. Clear Position Signal: J < Max_J * 0.6
             # Can happen from 1.0 directly or from 0.5 (after first sell)
@@ -186,10 +202,10 @@ def run_strategy(df, initial_capital=100000):
                     shares = 0
                     position_pct = 0.0
                     in_exit_phase = False # Reset
-                    action = "SELL_ALL"
+                    action = "清仓 (卖出)"
                     trades.append({
-                        'Date': date, 'Action': 'SELL_ALL', 'Price': price, 
-                        'Shares': shares_sold, 'J': kdj_j, 'Max_J': max_j_since_full
+                        '日期': date, '操作': '清仓 (卖出)', '价格': price, 
+                        '股数': shares_sold, 'J值': kdj_j, 'Max_J': max_j_since_full
                     })
                     # Reset State
                     max_j_since_full = -999
@@ -216,45 +232,24 @@ def calculate_performance_breakdown(equity_curve):
     # First month PnL = End Equity - Initial Capital (if first entry) or Previous Month End
     # But simpler: shift equity by 1 to get start equity
     monthly['Start_Equity'] = monthly['Equity'].shift(1)
-    # For the first month, we need to find the equity at the very beginning of the backtest
-    # Or assume the first record in equity_curve is the start.
-    # Actually, equity_curve starts from index 20 of daily data.
-    # Let's use the first available equity in the curve as the start base for the first month?
-    # Better: Use the initial capital (100000) for the very first period? 
-    # Or just use the equity curve diff.
     
-    # Let's refine:
-    # We want exact profit per month.
-    # Profit = Equity_End - Equity_Start
-    # Equity_Start of Month M is Equity_End of Month M-1.
-    
-    # Fill the first NaN Start_Equity with the first equity value from the daily curve 
-    # (or better, the value before the first month end). 
-    # A robust way:
-    # 1. Get month ends
-    # 2. Add the very first start date equity to the series
+    # Fill first start equity properly
+    # If the backtest starts mid-month, the first month start equity should be initial capital
+    # We can infer it from the diff
     
     # Simpler approach using diff() on the resampled series
     monthly['Profit'] = monthly['Equity'].diff()
     
-    # Fix first month profit: 
-    # It currently is NaN. We need (First Month End Equity - Equity at start of backtest)
-    initial_equity = df.iloc[0]['Equity'] 
-    # Actually, 'initial_equity' in the dataframe is the equity at day 20. 
-    # If the first month end is later than day 20, the diff is correct if we insert the start.
-    
-    # Let's just fill the first NaN with (First Month Equity - Initial Capital)
-    # Assuming start capital is 100000. But if we run multiple stocks, we need to pass it or infer.
-    # Let's infer from the first row of daily data if possible, or just use 100000 default.
-    # The 'run_strategy' uses 100000.
-    
+    # Fix first month profit
     first_month_idx = monthly.index[0]
-    # If the first daily record is in the same month as first_month_idx
     monthly.loc[first_month_idx, 'Profit'] = monthly.loc[first_month_idx, 'Equity'] - 100000
     
     # Recalculate Start_Equity for clarity
     monthly['Start_Equity'] = monthly['Equity'] - monthly['Profit']
     monthly['Return_Pct'] = (monthly['Profit'] / monthly['Start_Equity']) * 100
+    
+    # Rename columns to Chinese
+    monthly.columns = ['期初权益', '期末权益', '收益额', '收益率(%)']
     
     # --- Quarterly Breakdown ---
     quarterly = df.resample('Q').last()
@@ -263,7 +258,11 @@ def calculate_performance_breakdown(equity_curve):
     quarterly['Start_Equity'] = quarterly['Equity'] - quarterly['Profit']
     quarterly['Return_Pct'] = (quarterly['Profit'] / quarterly['Start_Equity']) * 100
     
-    return monthly[['Start_Equity', 'Equity', 'Profit', 'Return_Pct']], quarterly[['Start_Equity', 'Equity', 'Profit', 'Return_Pct']]
+    # Rename columns to Chinese
+    quarterly.columns = ['期初权益', '期末权益', '收益额', '收益率(%)']
+    
+    # Return with Chinese columns
+    return monthly[['期初权益', '期末权益', '收益额', '收益率(%)']], quarterly[['期初权益', '期末权益', '收益额', '收益率(%)']]
 
 def plot_results(df, trades_df, ticker_name=""):
     """
@@ -273,34 +272,36 @@ def plot_results(df, trades_df, ticker_name=""):
     
     # Subplot 1: Price and MA20 with Buy/Sell markers
     ax1 = plt.subplot(3, 1, 1)
-    ax1.plot(df.index, df['Close'], label='Close Price', alpha=0.6)
-    ax1.plot(df.index, df['MA20'], label='MA20', color='orange', linestyle='--')
+    ax1.plot(df.index, df['Close'], label='收盘价', alpha=0.6)
+    ax1.plot(df.index, df['MA20'], label='MA20均线', color='orange', linestyle='--')
     
     # Plot Buy/Sell markers
     if not trades_df.empty:
-        buys = trades_df[trades_df['Action'].str.contains('BUY|ADD')]
-        sells = trades_df[trades_df['Action'].str.contains('SELL')]
+        buys = trades_df[trades_df['操作'].str.contains('建仓|加仓')]
+        sells = trades_df[trades_df['操作'].str.contains('减仓|清仓')]
         
         # Map dates to index for plotting
         # We need to ensure we can find the index corresponding to the date
         df_reset = df.reset_index()
         
         for _, trade in buys.iterrows():
-            idx = df_reset[df_reset['Date'] == trade['Date']].index[0]
-            marker = '^' if trade['Action'] == 'BUY_BASE' else 'v' # Use different marker logic? No, Up arrow for buy
-            color = 'r' if trade['Action'] == 'BUY_BASE' else 'm' # Red for base, Magenta for add
-            ax1.scatter(idx, trade['Price'], marker='^', color=color, s=100, zorder=5, label=trade['Action'])
+            if trade['日期'] in df_reset['Date'].values:
+                idx = df_reset[df_reset['Date'] == trade['日期']].index[0]
+                marker = '^' 
+                color = 'r' if '建仓' in trade['操作'] else 'm' 
+                ax1.scatter(idx, trade['价格'], marker='^', color=color, s=100, zorder=5, label=trade['操作'])
 
         for _, trade in sells.iterrows():
-            idx = df_reset[df_reset['Date'] == trade['Date']].index[0]
-            color = 'g' if trade['Action'] == 'SELL_HALF' else 'k' # Green for half, Black for clear
-            ax1.scatter(idx, trade['Price'], marker='v', color=color, s=100, zorder=5, label=trade['Action'])
+             if trade['日期'] in df_reset['Date'].values:
+                idx = df_reset[df_reset['Date'] == trade['日期']].index[0]
+                color = 'g' if '减仓' in trade['操作'] else 'k' 
+                ax1.scatter(idx, trade['价格'], marker='v', color=color, s=100, zorder=5, label=trade['操作'])
 
     # Deduplicate legend labels
     handles, labels = ax1.get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
     ax1.legend(by_label.values(), by_label.keys())
-    ax1.set_title(f'{ticker_name} Price & Trades')
+    ax1.set_title(f'{ticker_name} 价格与交易记录')
     
     # Subplot 2: KDJ
     ax2 = plt.subplot(3, 1, 2, sharex=ax1)
@@ -320,6 +321,10 @@ def plot_results(df, trades_df, ticker_name=""):
     ax3.set_title('MA20 Slope')
     ax3.legend()
     
+    # Set x-axis limit to actual data range
+    if not df.empty:
+        plt.xlim(df.index.min(), df.index.max())
+    
     plt.tight_layout()
     filename = f'strategy_result_{ticker_name}.png'
     plt.savefig(filename)
@@ -333,7 +338,7 @@ if __name__ == "__main__":
     
     # Targets: Name -> Ticker
     targets = {
-        '四方股份': '601126.SS'
+        '四方精创': '300468.SZ'
     }
     
     print(f"Backtesting Period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}\n")
@@ -367,28 +372,28 @@ if __name__ == "__main__":
         trades, equity = run_strategy(df)
         
         # 4. Output Results
-        print(f"\n--- Trade Log: {name} ---")
+        print(f"\n--- 交易记录: {name} ---")
         if not trades.empty:
-            print(trades[['Date', 'Action', 'Price', 'J', 'Slope', 'Shares']].to_string())
+            print(trades[['日期', '操作', '价格', '股数', 'J值', 'MA20斜率']].to_string())
             
             final_equity = equity.iloc[-1]['Equity']
-            print(f"\nInitial Capital: 100000")
-            print(f"Final Equity: {final_equity:.2f}")
-            print(f"Total Return: {((final_equity - 100000) / 100000) * 100:.2f}%")
+            print(f"\n初始资金: 100000")
+            print(f"最终权益: {final_equity:.2f}")
+            print(f"总收益率: {((final_equity - 100000) / 100000) * 100:.2f}%")
             
             # Calculate Monthly/Quarterly Breakdown
             monthly_perf, quarterly_perf = calculate_performance_breakdown(equity)
             
-            print(f"\n--- Monthly Performance: {name} ---")
+            print(f"\n--- 月度收益表现: {name} ---")
             pd.set_option('display.float_format', '{:.2f}'.format)
             print(monthly_perf.to_string())
             
-            print(f"\n--- Quarterly Performance: {name} ---")
+            print(f"\n--- 季度收益表现: {name} ---")
             print(quarterly_perf.to_string())
             
             # 5. Plot
             plot_results(df, trades, ticker_name=name)
         else:
-            print("No trades triggered.")
+            print("没有触发交易。")
         
         print("\n")
